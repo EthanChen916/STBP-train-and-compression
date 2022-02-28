@@ -4,12 +4,14 @@ import torch.nn.functional as F
 import torch.optim as optim
 
 steps = 16
-dt = 5
-simwin = dt * steps
-a = 0.25
 aa = 0.5  # 梯度近似项
-# Vth = 1.0  # 阈值电压 V_threshold
-tau = 1.0  # 漏电常熟 tau
+tau = 1.0  # 漏电常数 tau
+
+
+def config_snn_param(args):
+    global steps, tau
+    steps = args.timesteps
+    tau = args.tau
 
 
 class SpikeAct(torch.autograd.Function):
@@ -31,7 +33,10 @@ class SpikeAct(torch.autograd.Function):
         # hu is an approximate func of df/du
         hu = abs(input) < aa
         hu = hu.float() / (2 * aa)
-        return grad_input * hu
+
+        # 默认返回所有forward参数个数的loss，即为每一个输入参数（input和Vth）返回loss，由于只需要给input
+        # 返回，其他的就直接返回None
+        return grad_input * hu, None
 
 
 spikeAct = SpikeAct.apply
@@ -42,6 +47,38 @@ def state_update(u_t_n1, o_t_n1, W_mul_o_t1_n, Vth):
     # u_t1_n1 = tau * u_t_n1 * (1 - o_t_n1) + W_mul_o_t1_n  # zero模式下tau=1.0与subtraction模式结果相同
     o_t1_n1 = spikeAct(u_t1_n1, Vth)
     return u_t1_n1, o_t1_n1
+
+
+class SpikeTensor:
+    def __init__(self, data, timesteps):
+        """
+        wrapper for pytorch Tensor.
+        data shape: [b, c, h, w, t]
+        """
+        self.data = data
+        self.timesteps = timesteps
+        self.b = self.data.size(0)
+        self.chw = self.data.size()[1:3]
+
+    def size(self, *args):
+        """
+        wrapper for self.data.size()
+        """
+        return self.data.size(*args)
+
+    def view(self, *args):
+        """
+        wrapper for self.data.view()
+        args: [b, c*h*w]
+        """
+        return SpikeTensor(self.data.view(*args, self.timesteps), self.timesteps)
+
+    def firing_ratio(self):
+        """
+        calculate the firing ratio over the timesteps which approximate the number in ANN
+        """
+        firing_ratio = torch.sum(self.data, dim=2) / steps
+        return firing_ratio
 
 
 class tdLayer(nn.Module):
@@ -61,14 +98,23 @@ class tdLayer(nn.Module):
         self.bn = bn
 
     def forward(self, x):
-        x_ = torch.zeros((steps,) + self.layer(x[0, ...]).shape, device=x.device)
+        if isinstance(x, SpikeTensor):
+            x = x.data
+            isSpikeTensor = True
+        else:
+            isSpikeTensor = False
+
+        x_ = torch.zeros(self.layer(x[..., 0]).shape + (steps,), device=x.device)
+        # x_ = WrappedTensor(torch.zeros(self.layer(x[..., 0]).shape + (steps,))).to(x.device)
         for step in range(steps):
-            x_[step, ...] = self.layer(x[step, ...])
+            x_[..., step] = self.layer(x[..., step])
 
         if self.bn is not None:
-            # 补充bn操作
-            for step in range(steps):
-                x_[step, ...] = self.bn(x_[step, ...])
+            x_ = self.bn(x_)
+
+        if isSpikeTensor:
+            x_ = SpikeTensor(x_, steps)
+
         return x_
 
 
@@ -82,8 +128,21 @@ class LIFSpike(nn.Module):
         self.Vth = vth
 
     def forward(self, x):
-        u = torch.zeros(x.shape[1:], device=x.device)
+        if isinstance(x, SpikeTensor):
+            x = x.data
+            isSpikeTensor = True
+        else:
+            isSpikeTensor = False
+
+        u = torch.zeros(x.shape[:-1], device=x.device)
         out = torch.zeros(x.shape, device=x.device)
+        # u = WrappedTensor(torch.zeros(x.shape[:-1])).to(x.device)
+        # out = WrappedTensor(torch.zeros(x.shape)).to(x.device)
+
         for step in range(steps):
-            u, out[step, ...] = state_update(u, out[max(step-1, 0), ...], x[step, ...], self.Vth)
+            u, out[..., step] = state_update(u, out[..., max(step-1, 0)], x[..., step], self.Vth)
+
+        if isSpikeTensor:
+            out = SpikeTensor(out, steps)
+
         return out
